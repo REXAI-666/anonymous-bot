@@ -3,15 +3,41 @@ const TelegramBot = require("node-telegram-bot-api");
 const token = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID;
 const FORCE_CHANNEL = process.env.FORCE_CHANNEL;
-const BOT_USERNAME = process.env.BOT_USERNAME; // SecretCrushXBot
+const BOT_USERNAME = process.env.BOT_USERNAME;
 
 const bot = new TelegramBot(token, { polling: true });
-const replyMap = {}; // admin reply tracking
-const linkMap = {};  // public link tracking
 
 console.log("Bot started...");
 
-// 🔒 check if user joined channel
+// ===== STORAGE =====
+const replyMap = {};   // admin reply tracking
+const linkMap = {};    // public link sender → receiver
+const userMessageLog = {}; // anti-spam log
+
+// ===== ANTI-SPAM CONFIG =====
+const MESSAGE_LIMIT = 5; // messages
+const TIME_WINDOW = 60 * 60 * 1000; // 1 hour
+
+function isSpamming(userId) {
+  const now = Date.now();
+
+  if (!userMessageLog[userId]) {
+    userMessageLog[userId] = [];
+  }
+
+  userMessageLog[userId] = userMessageLog[userId].filter(
+    (t) => now - t < TIME_WINDOW
+  );
+
+  if (userMessageLog[userId].length >= MESSAGE_LIMIT) {
+    return true;
+  }
+
+  userMessageLog[userId].push(now);
+  return false;
+}
+
+// ===== FORCE JOIN CHECK =====
 async function isJoined(userId) {
   try {
     const member = await bot.getChatMember(FORCE_CHANNEL, userId);
@@ -21,12 +47,11 @@ async function isJoined(userId) {
   }
 }
 
-// ▶️ /start (normal + public link)
+// ===== START COMMAND (NORMAL + PUBLIC LINK) =====
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const userId = msg.from.id;
-  const payload = match[1]; // link owner id (if any)
+  const payload = match[1];
 
-  // force join check
   const joined = await isJoined(userId);
   if (!joined) {
     return bot.sendMessage(
@@ -48,27 +73,27 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
     );
   }
 
-  // started via shared link
+  // Opened via shared link
   if (payload && payload !== userId.toString()) {
-    linkMap[userId] = payload; // who will receive message
+    linkMap[userId] = payload;
     return bot.sendMessage(
       msg.chat.id,
       "💌 You opened a Secret Inbox!\n\n✉️ Send your anonymous message below 👇"
     );
   }
 
-  // normal start (give personal link)
+  // Normal start
   const shareLink = `https://t.me/${BOT_USERNAME}?start=${userId}`;
 
   bot.sendMessage(
     msg.chat.id,
     `👋 Welcome to Anonymous Inbox\n\n` +
-    `🔗 Your personal anonymous link:\n${shareLink}\n\n` +
-    `📢 Share this link to receive secret messages!`
+      `🔗 Your personal anonymous link:\n${shareLink}\n\n` +
+      `📢 Share this link to receive secret messages!`
   );
 });
 
-// 🔁 Joined button re-check
+// ===== JOIN CHECK BUTTON =====
 bot.on("callback_query", async (q) => {
   if (q.data === "check_join") {
     const joined = await isJoined(q.from.id);
@@ -78,6 +103,7 @@ bot.on("callback_query", async (q) => {
         show_alert: true
       });
     }
+
     bot.sendMessage(
       q.from.id,
       "✅ Verified!\nNow you can use the bot."
@@ -85,15 +111,14 @@ bot.on("callback_query", async (q) => {
   }
 });
 
-// 📨 message handler
+// ===== MESSAGE HANDLER =====
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/start")) return;
 
-  // force join check again
   const joined = await isJoined(msg.from.id);
   if (!joined) return;
 
-  // 👑 admin replying
+  // ===== ADMIN REPLY =====
   if (
     msg.reply_to_message &&
     msg.from.id.toString() === ADMIN_ID
@@ -112,7 +137,17 @@ bot.on("message", async (msg) => {
     );
   }
 
-  // 👤 user sending anonymous message via link
+  // ===== ANTI-SPAM (SKIP ADMIN) =====
+  if (msg.from.id.toString() !== ADMIN_ID) {
+    if (isSpamming(msg.from.id)) {
+      return bot.sendMessage(
+        msg.chat.id,
+        "🚫 Slow down!\nYou can send only 5 messages per hour."
+      );
+    }
+  }
+
+  // ===== USER SENDING ANONYMOUS MESSAGE =====
   const targetUser = linkMap[msg.from.id];
   if (targetUser) {
     const sent = await bot.sendMessage(
