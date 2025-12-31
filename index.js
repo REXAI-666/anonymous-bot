@@ -9,18 +9,20 @@ const replyMap = {};
 
 console.log("Bot started...");
 
-// 🔒 check channel join
+// 🔒 force join check
 async function isJoined(userId) {
   try {
     const member = await bot.getChatMember(FORCE_CHANNEL, userId);
     return ["member", "administrator", "creator"].includes(member.status);
-  } catch (e) {
+  } catch {
     return false;
   }
 }
 
-bot.onText(/\/start/, async (msg) => {
+// ▶️ START with payload (public link)
+bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const userId = msg.from.id;
+  const payload = match[1]; // who owns the link
 
   const joined = await isJoined(userId);
   if (!joined) {
@@ -38,36 +40,42 @@ bot.onText(/\/start/, async (msg) => {
     );
   }
 
+  // if started via shared link
+  if (payload && payload !== userId.toString()) {
+    replyMap[msg.message_id] = payload;
+    return bot.sendMessage(
+      msg.chat.id,
+      "💌 You opened a Secret Inbox!\n\n✉️ Send your anonymous message below 👇"
+    );
+  }
+
+  // normal start
+  const shareLink = `https://t.me/${bot.username}?start=${userId}`;
+
   bot.sendMessage(
     msg.chat.id,
-    "👋 Welcome to Anonymous Inbox\n\n✉️ Send any message. Your identity will stay hidden."
+    `👋 Welcome to Anonymous Inbox\n\n🔗 Your personal anonymous link:\n${shareLink}\n\n📢 Share this link to receive secret messages!`
   );
 });
 
-// 🔁 re-check join
-bot.on("callback_query", async (query) => {
-  if (query.data === "check_join") {
-    const joined = await isJoined(query.from.id);
-
+// 🔁 joined button
+bot.on("callback_query", async (q) => {
+  if (q.data === "check_join") {
+    const joined = await isJoined(q.from.id);
     if (!joined) {
-      return bot.answerCallbackQuery(query.id, {
+      return bot.answerCallbackQuery(q.id, {
         text: "❌ You haven't joined yet!",
         show_alert: true
       });
     }
-
-    bot.sendMessage(
-      query.from.id,
-      "✅ Verified!\nNow you can send anonymous messages."
-    );
+    bot.sendMessage(q.from.id, "✅ Verified! Now send your message.");
   }
 });
 
-// 📨 main message handler
+// 📨 message handler
 bot.on("message", async (msg) => {
-  if (msg.text === "/start") return;
+  if (msg.text?.startsWith("/start")) return;
 
-  // 🔒 force check again
   const joined = await isJoined(msg.from.id);
   if (!joined) return;
 
@@ -75,19 +83,17 @@ bot.on("message", async (msg) => {
   if (msg.reply_to_message && msg.from.id.toString() === ADMIN_ID) {
     const userId = replyMap[msg.reply_to_message.message_id];
     if (!userId) return;
-
     return bot.sendMessage(userId, `📩 Reply from admin:\n\n${msg.text}`);
   }
 
-  // 👤 normal user
-  if (msg.from.id.toString() !== ADMIN_ID) {
+  // 👤 user sending message via shared link
+  const targetId = replyMap[msg.message_id];
+  if (targetId) {
     const sent = await bot.sendMessage(
       ADMIN_ID,
-      `📥 New Anonymous Message\n\n💬 ${msg.text}\n\n↩️ Reply to this message to respond`
+      `📥 New Secret Message\n\n💬 ${msg.text}\n\n↩️ Reply to respond`
     );
-
     replyMap[sent.message_id] = msg.from.id;
-
-    bot.sendMessage(msg.chat.id, "✅ Your anonymous message has been sent.");
+    return bot.sendMessage(msg.chat.id, "✅ Your secret message has been sent.");
   }
 });
