@@ -1,165 +1,177 @@
 const TelegramBot = require("node-telegram-bot-api");
+const fs = require("fs");
 
+// ===== ENV =====
 const token = process.env.BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID;
-const FORCE_CHANNEL = process.env.FORCE_CHANNEL;
+const MAIN_ADMIN = process.env.ADMIN_ID;
+const ADMINS = (process.env.ADMINS || "").split(",").filter(Boolean);
 const BOT_USERNAME = process.env.BOT_USERNAME;
 
-const bot = new TelegramBot(token, { polling: true });
+// multiple force join channels (comma separated usernames)
+const FORCE_CHANNELS = (process.env.FORCE_CHANNELS || "")
+  .split(",")
+  .map(c => c.trim())
+  .filter(Boolean);
 
+// ===== BOT =====
+const bot = new TelegramBot(token, { polling: true });
 console.log("Bot started...");
 
-// ===== STORAGE =====
-const replyMap = {};   // admin reply tracking
-const linkMap = {};    // public link sender → receiver
-const userMessageLog = {}; // anti-spam log
+// ===== DATABASE (FILE) =====
+const DB_FILE = "./db.json";
+let db = {
+  users: {},
+  banned: {},
+  stats: {},
+  anonEnabled: true
+};
 
-// ===== ANTI-SPAM CONFIG =====
-const MESSAGE_LIMIT = 5; // messages
-const TIME_WINDOW = 60 * 60 * 1000; // 1 hour
-
-function isSpamming(userId) {
-  const now = Date.now();
-
-  if (!userMessageLog[userId]) {
-    userMessageLog[userId] = [];
-  }
-
-  userMessageLog[userId] = userMessageLog[userId].filter(
-    (t) => now - t < TIME_WINDOW
-  );
-
-  if (userMessageLog[userId].length >= MESSAGE_LIMIT) {
-    return true;
-  }
-
-  userMessageLog[userId].push(now);
-  return false;
+if (fs.existsSync(DB_FILE)) {
+  db = JSON.parse(fs.readFileSync(DB_FILE));
 }
 
-// ===== FORCE JOIN CHECK =====
-async function isJoined(userId) {
-  try {
-    const member = await bot.getChatMember(FORCE_CHANNEL, userId);
-    return ["member", "administrator", "creator"].includes(member.status);
-  } catch {
-    return false;
-  }
+function saveDB() {
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
-// ===== START COMMAND (NORMAL + PUBLIC LINK) =====
+// ===== HELPERS =====
+function isAdmin(id) {
+  return id.toString() === MAIN_ADMIN || ADMINS.includes(id.toString());
+}
+
+async function isJoinedAll(userId) {
+  for (const ch of FORCE_CHANNELS) {
+    try {
+      const m = await bot.getChatMember(ch, userId);
+      if (!["member", "administrator", "creator"].includes(m.status)) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ===== /START =====
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const userId = msg.from.id;
+  db.users[userId] = true;
+  db.stats[userId] = db.stats[userId] || { sent: 0 };
+  saveDB();
+
+  if (db.banned[userId]) return;
+
+  if (!(await isJoinedAll(userId))) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "🔒 Bot use karne ke liye **sab channels join** karna zaroori hai 👇"
+    );
+  }
+
+  if (!db.anonEnabled) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "⛔ Anonymous inbox abhi OFF hai.\nBaad me try karo."
+    );
+  }
+
   const payload = match[1];
-
-  const joined = await isJoined(userId);
-  if (!joined) {
-    return bot.sendMessage(
-      msg.chat.id,
-      "🔒 To use this bot, you must join our channel first 👇",
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "📢 Join Channel",
-                url: `https://t.me/${FORCE_CHANNEL.replace("@", "")}`
-              }
-            ],
-            [{ text: "✅ Joined", callback_data: "check_join" }]
-          ]
-        }
-      }
-    );
-  }
-
-  // Opened via shared link
   if (payload && payload !== userId.toString()) {
-    linkMap[userId] = payload;
+    db.users[payload] = true;
+    saveDB();
     return bot.sendMessage(
       msg.chat.id,
-      "💌 You opened a Secret Inbox!\n\n✉️ Send your anonymous message below 👇"
+      "💌 Secret Inbox Opened!\nText / Photo / Voice bhejo (Video ❌)"
     );
   }
 
-  // Normal start
-  const shareLink = `https://t.me/${BOT_USERNAME}?start=${userId}`;
-
+  const link = `https://t.me/${BOT_USERNAME}?start=${userId}`;
   bot.sendMessage(
     msg.chat.id,
-    `👋 Welcome to Anonymous Inbox\n\n` +
-      `🔗 Your personal anonymous link:\n${shareLink}\n\n` +
-      `📢 Share this link to receive secret messages!`
+    `👋 Welcome!\n\n🔗 Tumhara anonymous link:\n${link}`
   );
 });
 
-// ===== JOIN CHECK BUTTON =====
-bot.on("callback_query", async (q) => {
-  if (q.data === "check_join") {
-    const joined = await isJoined(q.from.id);
-    if (!joined) {
-      return bot.answerCallbackQuery(q.id, {
-        text: "❌ You haven't joined yet!",
-        show_alert: true
-      });
-    }
+// ===== ADMIN COMMANDS =====
 
-    bot.sendMessage(
-      q.from.id,
-      "✅ Verified!\nNow you can use the bot."
-    );
+// ON / OFF anonymous
+bot.onText(/\/anon_on/, msg => {
+  if (!isAdmin(msg.from.id)) return;
+  db.anonEnabled = true;
+  saveDB();
+  bot.sendMessage(msg.chat.id, "✅ Anonymous mode ON");
+});
+
+bot.onText(/\/anon_off/, msg => {
+  if (!isAdmin(msg.from.id)) return;
+  db.anonEnabled = false;
+  saveDB();
+  bot.sendMessage(msg.chat.id, "⛔ Anonymous mode OFF");
+});
+
+// user stats
+bot.onText(/\/userstats (\d+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const id = match[1];
+  const s = db.stats[id];
+  if (!s) {
+    return bot.sendMessage(msg.chat.id, "❌ No data for this user");
   }
+  bot.sendMessage(
+    msg.chat.id,
+    `📊 User ${id}\nMessages sent: ${s.sent}`
+  );
+});
+
+// ban / unban (MAIN ADMIN)
+bot.onText(/\/ban (\d+)/, (msg, match) => {
+  if (msg.from.id.toString() !== MAIN_ADMIN) return;
+  db.banned[match[1]] = true;
+  saveDB();
+  bot.sendMessage(msg.chat.id, "🚫 User banned");
+});
+
+bot.onText(/\/unban (\d+)/, (msg, match) => {
+  if (msg.from.id.toString() !== MAIN_ADMIN) return;
+  delete db.banned[match[1]];
+  saveDB();
+  bot.sendMessage(msg.chat.id, "✅ User unbanned");
 });
 
 // ===== MESSAGE HANDLER =====
-bot.on("message", async (msg) => {
-  if (!msg.text || msg.text.startsWith("/start")) return;
+bot.on("message", async msg => {
+  const userId = msg.from.id;
+  if (msg.text?.startsWith("/start")) return;
+  if (db.banned[userId]) return;
+  if (!db.anonEnabled) return;
+  if (!(await isJoinedAll(userId))) return;
 
-  const joined = await isJoined(msg.from.id);
-  if (!joined) return;
+  db.stats[userId] = db.stats[userId] || { sent: 0 };
+  db.stats[userId].sent++;
+  saveDB();
 
-  // ===== ADMIN REPLY =====
-  if (
-    msg.reply_to_message &&
-    msg.from.id.toString() === ADMIN_ID
-  ) {
-    const userId = replyMap[msg.reply_to_message.message_id];
-    if (!userId) {
-      return bot.sendMessage(
-        ADMIN_ID,
-        "❌ Reply failed. User not found."
-      );
-    }
-
-    return bot.sendMessage(
-      userId,
-      `📩 Reply from admin:\n\n${msg.text}`
-    );
-  }
-
-  // ===== ANTI-SPAM (SKIP ADMIN) =====
-  if (msg.from.id.toString() !== ADMIN_ID) {
-    if (isSpamming(msg.from.id)) {
-      return bot.sendMessage(
-        msg.chat.id,
-        "🚫 Slow down!\nYou can send only 5 messages per hour."
-      );
-    }
-  }
-
-  // ===== USER SENDING ANONYMOUS MESSAGE =====
-  const targetUser = linkMap[msg.from.id];
-  if (targetUser) {
-    const sent = await bot.sendMessage(
-      ADMIN_ID,
-      `📥 New Secret Message\n\n💬 ${msg.text}\n\n↩️ Reply to respond`
-    );
-
-    replyMap[sent.message_id] = msg.from.id;
-
+  // BLOCK VIDEO
+  if (msg.video) {
     return bot.sendMessage(
       msg.chat.id,
-      "✅ Your anonymous message has been sent."
+      "❌ Video allowed nahi hai"
     );
+  }
+
+  // forward to main admin
+  if (msg.text) {
+    bot.sendMessage(
+      MAIN_ADMIN,
+      `📥 Anonymous Message\n\n${msg.text}`
+    );
+  } else if (msg.photo) {
+    bot.sendPhoto(MAIN_ADMIN, msg.photo.at(-1).file_id, {
+      caption: "📥 Anonymous Photo"
+    });
+  } else if (msg.voice) {
+    bot.sendVoice(MAIN_ADMIN, msg.voice.file_id, {
+      caption: "📥 Anonymous Voice"
+    });
   }
 });
